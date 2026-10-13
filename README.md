@@ -2,7 +2,7 @@
 
 ![CineFlow Preload](build/bg.png)
 
-流畅、可定制的桌面电影 / 节目推荐应用。（已在Linux Do上发布公告）
+流畅、可定制的桌面电影 / 节目推荐应用。（已在linux开源社区上发布）
 
 **CineFlow** 基于Electron + Vite构建，使用TMDB数据源，支持自然语言搜索、个性化推荐、灵动岛模式、外部片源导入与应用内播放。
 
