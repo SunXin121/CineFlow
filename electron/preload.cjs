@@ -38,5 +38,20 @@ contextBridge.exposeInMainWorld('cineflow', {
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
   onWindowMode: (callback) => {
     ipcRenderer.on('window:mode', (_event, payload) => callback?.(payload));
-  }
+  },
+  // v3.4.0 投屏（纯增量新增 API，全部走 cast:* 通道）
+  castScan: () => ipcRenderer.invoke('cast:scan'),
+  castList: () => ipcRenderer.invoke('cast:list'),
+  castStopSearch: () => ipcRenderer.invoke('cast:stop-search'),
+  castRefreshBluetooth: () => ipcRenderer.invoke('cast:refresh-bluetooth'),
+  castOpenBluetoothSettings: () => ipcRenderer.invoke('cast:open-bluetooth-settings'),
+  castTo: (payload) => ipcRenderer.invoke('cast:to', payload),
+  castStop: (payload) => ipcRenderer.invoke('cast:stop', payload),
+  onCastDevices: (callback) => {
+    ipcRenderer.on('cast:devices', (_event, payload) => callback?.(payload));
+  },
+  // v3.4.0 海报兜底（纯增量）：直连失败时请主进程经 DoH 通道回传图片字节
+  relayImage: (url) => ipcRenderer.invoke('image:relay', { url }),
+  // v3.4.0 片源管理（纯增量）：单个播放源的手动测速
+  testResourceSource: (payload) => ipcRenderer.invoke('resources:testSource', payload)
 });

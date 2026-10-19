@@ -183,6 +183,8 @@ function createPlaybackProxyGuard(deps) {
   }
 
   async function handleDirectUpstream(req, res, targetUrl) {
+    // v3.4.0：DoH 端点不可达时立刻让位给主进程原生上行，避免每个分片等满 8s 超时造成卡顿
+    if (typeof doh?.health === 'function' && !doh.health().reachable) return false;
     const {
       isLikelyM3u8Response,
       isLikelyMpdResponse,

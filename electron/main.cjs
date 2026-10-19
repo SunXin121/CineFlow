@@ -8,6 +8,7 @@ const { createDohResolver } = require('./doh.cjs');
 const { createMetaServer } = require('./meta-server.cjs');
 const { createPlaybackProxyGuard } = require('./proxy-monitor.cjs');
 const { filterAdsFromM3u8 } = require('./ad-filter.cjs');
+const { createCastController } = require('./cast.cjs'); // v3.4.0 投屏（纯增量模块）
 
 try {
   app.commandLine.appendSwitch('ignore-gpu-blocklist');
@@ -141,6 +142,15 @@ function initNetworkAcceleration() {
       getCredential
     });
     metaServer.install().catch(() => {});
+    // v3.4.0：启动即探测 DoH 端点在当前网络下是否可达，并顺带预热海报域名解析；
+    // 不可达时 meta-server / proxy-monitor 会自动放弃接管，回退原生网络栈。
+    setTimeout(() => {
+      try {
+        dohResolver?.ping?.();
+      } catch {
+        // best-effort
+      }
+    }, 800);
     playbackProxyGuard = createPlaybackProxyGuard({
       session,
       doh: dohResolver,
@@ -2275,6 +2285,22 @@ app.whenReady().then(() => {
   initNetworkAcceleration();
   applyProxySetting({ force: true }).catch(() => {});
 
+  // v3.4.0 投屏（纯增量）：Web Bluetooth 设备选择回调只用于回捞"实时发现的设备名"给投屏面板，
+  // 一律回调空字符串，绝不主动连接任何设备。
+  try {
+    session.defaultSession.on('select-bluetooth-device', (event, discoveryEvent) => {
+      try {
+        event.preventDefault();
+        castController.publishBluetoothDiscovered(discoveryEvent?.devices || []);
+        event.callback('');
+      } catch {
+        // Web Bluetooth 不可用时忽略
+      }
+    });
+  } catch {
+    // 旧版本无该事件时忽略
+  }
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -2482,6 +2508,10 @@ ipcMain.handle('tmdb:discover', async (_event, options = {}) => {
     'vote_count.gte': options.minVotes || 80,
     'vote_average.gte': options.minRating || undefined,
     include_adult: false,
+    // v3.4.0 纯增量：分类片库按年份筛选；未传 options.year 时与既有行为完全一致
+    primary_release_year: options.year || undefined,
+    // v3.4.0 纯增量：分类片库"2000~"这类上界年份档；未传 options.yearTo 时行为不变
+    'primary_release_date.lte': options.yearTo || undefined,
     page: options.page || 1,
     region: DEFAULT_REGION
   };
@@ -2492,6 +2522,9 @@ ipcMain.handle('tmdb:discover', async (_event, options = {}) => {
     'vote_count.gte': options.minVotes || 80,
     'vote_average.gte': options.minRating || undefined,
     include_adult: false,
+    // v3.4.0 纯增量：节目按首播年份筛选，同上一处、未传时行为不变
+    first_air_date_year: options.year || undefined,
+    'first_air_date.lte': options.yearTo || undefined,
     page: options.page || 1
   };
   const tasks = [];
@@ -2638,3 +2671,136 @@ function compactVideos(videos = []) {
     }));
 }
 
+/* ================= v3.4.0 投屏（纯增量） =================
+   新增 electron/cast.cjs：SSDP 发现 DLNA MediaRenderer + 本机蓝牙只读枚举。
+   以下通道全部 try/catch 包裹，失败只让投屏面板为空，不影响既有播放链路。 */
+const castController = createCastController({
+  isWin32: process.platform === 'win32',
+  getSender: () => mainWindow,
+  openBluetoothSettings: () => {
+    const target = process.platform === 'win32'
+      ? 'ms-settings:bluetooth'
+      : 'x-apple.systempreferences:com.apple.preference.Bluetooth';
+    try {
+      shell.openExternal(target);
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
+  }
+});
+
+ipcMain.handle('cast:scan', () => castController.startScan());
+ipcMain.handle('cast:list', () => castController.snapshot());
+ipcMain.handle('cast:stop-search', () => castController.stopScan());
+ipcMain.handle('cast:refresh-bluetooth', () => castController.refreshBluetooth(true));
+ipcMain.handle('cast:open-bluetooth-settings', () => castController.openBluetoothSettings());
+ipcMain.handle('cast:to', async (_event, payload = {}) => {
+  try {
+    return await castController.castTo(payload.device, payload.url, payload.title);
+  } catch (error) {
+    return { ok: false, error: error?.message || '投屏失败' };
+  }
+});
+ipcMain.handle('cast:stop', async (_event, payload = {}) => {
+  try {
+    return await castController.stopCast(payload.device);
+  } catch (error) {
+    return { ok: false, error: error?.message || '停止投屏失败' };
+  }
+});
+
+
+/* ================= v3.4.0 海报兜底（纯增量） =================
+   渲染端 <img> 直连失败时（直连模式 DNS 污染、或图片重定向尚未注册），
+   由主进程复用 meta-server 的 DoH 取字节通道回传 data URL。
+   只读复用既有能力，不改动任何原有请求链路。
+*/
+const RELAY_IMAGE_HOSTS = new Set(['image.tmdb.org', 'static-1.themoviedb.org', 'media.themoviedb.org']);
+const RELAY_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+ipcMain.handle('image:relay', async (_event, payload = {}) => {
+  const target = String(payload?.url || '');
+  let host = '';
+  try {
+    const parsed = new URL(target);
+    host = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== 'https:') return { ok: false, error: '仅支持 https 图片' };
+  } catch {
+    return { ok: false, error: '无效的图片地址' };
+  }
+  if (!RELAY_IMAGE_HOSTS.has(host)) return { ok: false, error: '非海报域名' };
+  if (!metaServer || typeof metaServer.fetchImageBytes !== 'function') {
+    return { ok: false, error: '加速模块未就绪' };
+  }
+  try {
+    const result = await metaServer.fetchImageBytes(target);
+    const buffer = result?.buffer;
+    const status = Number(result?.status || 0);
+    if (status < 200 || status >= 300 || !buffer || !buffer.length) {
+      return { ok: false, error: `上游状态 ${status || 0}` };
+    }
+    if (buffer.length > RELAY_IMAGE_MAX_BYTES) return { ok: false, error: '图片过大' };
+    return {
+      ok: true,
+      contentType: result.contentType || 'image/jpeg',
+      base64: buffer.toString('base64')
+    };
+  } catch (error) {
+    return { ok: false, error: error?.message || '海报中转失败' };
+  }
+});
+
+/* ================= v3.4.0 片源手动测速（纯增量） =================
+   渲染端"片源管理"面板点一下就能量一个源的接口往返。
+   只复用既有能力：buildResourceUrl 拼地址、applyProxySetting 取当前代理、
+   defaultSession.fetch 发请求（与 resourceFetchJson 同一条通道，量出来的才是真实手感）。
+   刻意不走 resourceResponseCache —— 命中缓存的第二次测速会报出 ~0ms 的假速度。
+*/
+ipcMain.handle('resources:testSource', async (_event, payload = {}) => {
+  const key = String(payload?.key || '');
+  const apiValue = String(payload?.api || '');
+  const source = getMergedResourceSources().find(
+    (item) => (key && item.key === key) || (apiValue && item.api === apiValue)
+  );
+  if (!source) return { ok: false, error: '未找到该播放源' };
+
+  let url;
+  try {
+    // ac=list 是苹果CMS系的类别接口，正文只有几 KB，适合当连通性探针
+    url = buildResourceUrl(source, { ac: 'list' });
+  } catch {
+    return { ok: false, error: '源地址不合法' };
+  }
+
+  await applyProxySetting().catch(() => {});
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RESOURCE_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await session.defaultSession.fetch(url.toString(), {
+      signal: controller.signal,
+      cache: 'no-store',
+      headers: {
+        accept: 'application/json, text/plain, */*',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 CineFlow/3.4.0'
+      }
+    });
+    const elapsedMs = Date.now() - startedAt;
+    const text = await response.text().catch(() => '');
+    const head = text.trimStart().slice(0, 1);
+    const kind = head === '<' ? 'xml' : (head === '{' || head === '[' ? 'json' : 'text');
+    if (!response.ok) return { ok: false, elapsedMs, status: response.status, error: `HTTP ${response.status}` };
+    return { ok: true, elapsedMs, status: response.status, kind, bytes: text.length };
+  } catch (error) {
+    const elapsedMs = Date.now() - startedAt;
+    const aborted = error?.name === 'AbortError' || controller.signal.aborted;
+    return {
+      ok: false,
+      elapsedMs,
+      error: aborted ? `超时 ${Math.round(RESOURCE_TIMEOUT_MS / 1000)}s` : (error?.message || '请求失败')
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+});

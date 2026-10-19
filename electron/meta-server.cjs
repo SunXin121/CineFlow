@@ -153,6 +153,9 @@ function createMetaServer(deps) {
 
   async function directRouteAllowed(urlStr) {
     if (!enabled()) return false;
+    // v3.4.0：DoH 端点不可达时彻底不接管，图片/API 走原生网络栈。
+    // 否则直连模式下每个请求都要白等 DoH 超时，海报整片空白。
+    if (typeof doh?.health === 'function' && !doh.health().reachable) return false;
     let host = '';
     try {
       host = new URL(urlStr).hostname;

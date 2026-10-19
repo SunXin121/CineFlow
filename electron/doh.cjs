@@ -9,6 +9,24 @@ const path = require('node:path');
 const DEFAULT_DOH_ENDPOINT = process.env.CINEFLOW_DOH_ENDPOINT || 'https://arkdo.ddd.oaifree.com/query-dns';
 const DOH_TYPES = { 4: 'A', 6: 'AAAA' };
 
+// v3.4.0 直连优化：连接复用（避免每个 HLS 分片重新 TCP+TLS 握手）
+const KEEP_ALIVE_HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15000,
+  maxSockets: 80,
+  maxFreeSockets: 24,
+  timeout: 30000
+});
+const KEEP_ALIVE_HTTP_AGENT = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15000,
+  maxSockets: 80,
+  maxFreeSockets: 24,
+  timeout: 30000
+});
+const DOH_UNREACHABLE_AFTER_FAILURES = 3;
+const DOH_REPROBE_MS = 20000;
+
 function normalizeDohEndpoint(value) {
   const text = String(value || DEFAULT_DOH_ENDPOINT).trim();
   if (!text) return DEFAULT_DOH_ENDPOINT;
@@ -49,8 +67,16 @@ function createDohResolver(options = {}) {
   const cacheFile = cacheDir ? path.join(cacheDir, 'doh-cache.json') : null;
 
   const memory = new Map();
+  const pending = new Map();
+  const failUntil = new Map();
   let persistTimer = null;
   let closed = false;
+  // v3.4.0：端点健康度。连续失败后判定不可达，让上层立刻回退原生网络栈，
+  // 避免每个请求都白等 DoH 超时（直连模式下海报空白与播放卡顿的主因）。
+  let endpointFailures = 0;
+  let endpointLastOkAt = 0;
+  let endpointLastFailAt = 0;
+  let endpointEverOk = false;
 
   function loadPersisted() {
     if (!cacheFile) return;
@@ -95,6 +121,31 @@ function createDohResolver(options = {}) {
     return memory.get(String(hostname).toLowerCase()) || null;
   }
 
+  function markEndpointOk() {
+    endpointFailures = 0;
+    endpointLastOkAt = Date.now();
+    endpointEverOk = true;
+  }
+
+  function markEndpointFailure() {
+    endpointFailures += 1;
+    endpointLastFailAt = Date.now();
+  }
+
+  function endpointHealthy() {
+    if (endpointFailures < DOH_UNREACHABLE_AFTER_FAILURES) return true;
+    return Date.now() - endpointLastFailAt >= DOH_REPROBE_MS;
+  }
+
+  function withEndpointFlag(error, reachable) {
+    try {
+      error.endpointReachable = reachable;
+    } catch {
+      // ignore
+    }
+    return error;
+  }
+
   function queryDoH(hostname, family) {
     return new Promise((resolve, reject) => {
       const type = DOH_TYPES[family] || 'A';
@@ -109,20 +160,24 @@ function createDohResolver(options = {}) {
       }
       const lib = url.protocol === 'http:' ? http : https;
       const req = lib.get(url.toString(), {
-        headers: { accept: 'application/dns-json', 'user-agent': 'CineFlow-DoH/3.2.0' },
+        agent: url.protocol === 'http:' ? KEEP_ALIVE_HTTP_AGENT : KEEP_ALIVE_HTTPS_AGENT,
+        headers: { accept: 'application/dns-json', 'user-agent': 'CineFlow-DoH/3.4.0' },
         timeout: lookupTimeoutMs
       }, (res) => {
         let text = '';
         res.setEncoding('utf8');
         res.on('data', (chunk) => {
           text += chunk;
-          if (text.length > 60000) req.destroy(new Error('DoH response too large'));
+          if (text.length > 60000) req.destroy(withEndpointFlag(new Error('DoH response too large'), true));
         });
         res.on('end', () => {
+          markEndpointOk();
           try {
             const payload = JSON.parse(text);
             if (Number(payload.Status) !== 0) {
-              reject(new Error(`DoH status ${payload.Status}`));
+              const answerError = new Error(`DoH status ${payload.Status}`);
+              answerError.endpointReachable = true;
+              reject(answerError);
               return;
             }
             const wantedType = family === 6 ? 28 : 1;
@@ -135,12 +190,15 @@ function createDohResolver(options = {}) {
               : 300;
             resolve({ addresses, ttlMs: Math.min(Math.max(minTtl * 1000, entryTtlFloorMs), entryTtlCapMs) });
           } catch (error) {
-            reject(error);
+            reject(withEndpointFlag(error, true));
           }
         });
       });
-      req.on('error', reject);
-      req.on('timeout', () => req.destroy(new Error('DoH query timeout')));
+      req.on('error', (error) => {
+        if (error?.endpointReachable !== true) markEndpointFailure();
+        reject(error);
+      });
+      req.on('timeout', () => req.destroy(withEndpointFlag(new Error('DoH query timeout'), false)));
     });
   }
 
@@ -161,21 +219,39 @@ function createDohResolver(options = {}) {
     return entry;
   }
 
+  async function resolveOnce(host, preferredFamily) {
+    const attempts = preferredFamily === 6 ? [6, 4] : [4, 6];
+    for (const family of attempts) {
+      try {
+        return await resolveWithDoH(host, family);
+      } catch (error) {
+        if (error?.emptyAnswer) {
+          failUntil.set(host, Date.now() + negativeTtlMs);
+          return null;
+        }
+        // 换下一个 family / 交给下方负缓存与陈旧回退
+      }
+    }
+    failUntil.set(host, Date.now() + negativeTtlMs);
+    return null;
+  }
+
   async function resolve(hostname, options = {}) {
     const host = String(hostname || '').toLowerCase();
     if (!host) return null;
     const cached = memoryGet(host);
     if (cached && cached.expiresAt > Date.now()) return cached;
+    // 端点已被判定不可达，或该域名刚解析失败：立刻返回陈旧结果，让上层走系统 DNS，
+    // 不再为每个 HLS 分片/每张海报重复等待 DoH 超时。
+    const failedRecently = failUntil.get(host) || 0;
+    if (failedRecently > Date.now() || !endpointHealthy()) return cached || null;
+    const inFlight = pending.get(host);
+    if (inFlight) return inFlight;
     const preferredFamily = Number(options.family) === 6 ? 6 : 4;
-    const attempts = preferredFamily === 6 ? [6, 4] : [4, 6];
-    for (const family of attempts) {
-      try {
-        return await resolveWithDoH(host, family);
-      } catch {
-        // try next family / fallback below
-      }
-    }
-    return cached || null;
+    const task = resolveOnce(host, preferredFamily).finally(() => pending.delete(host));
+    pending.set(host, task);
+    const result = await task;
+    return result || cached || null;
   }
 
   function lookup(hostname, options, callback) {
@@ -206,6 +282,7 @@ function createDohResolver(options = {}) {
       const cleanHeaders = { 'accept-encoding': 'identity', ...headers };
       const req = lib.request({
         protocol: targetUrl.protocol,
+        agent: isHttps ? KEEP_ALIVE_HTTPS_AGENT : KEEP_ALIVE_HTTP_AGENT,
         hostname: targetUrl.hostname,
         port: targetUrl.port || (isHttps ? 443 : 80),
         path: `${targetUrl.pathname}${targetUrl.search}`,
@@ -283,6 +360,27 @@ function createDohResolver(options = {}) {
     if (persistTimer) clearTimeout(persistTimer);
   }
 
+  function health() {
+    return {
+      reachable: endpointHealthy(),
+      failures: endpointFailures,
+      lastOkAt: endpointLastOkAt,
+      lastFailAt: endpointLastFailAt,
+      everOk: endpointEverOk,
+      endpoint
+    };
+  }
+
+  // 启动探测：直接查一次海报域名，既判定端点在直连下是否可达，又顺带预热海报域名解析。
+  async function ping() {
+    try {
+      await queryDoH('image.tmdb.org', 4);
+    } catch {
+      // 失败已由 queryDoH 记入健康度
+    }
+    return health();
+  }
+
   loadPersisted();
 
   return {
@@ -291,8 +389,10 @@ function createDohResolver(options = {}) {
     lookup,
     fetchUrl,
     close,
+    health,
+    ping,
     stats() {
-      return { entries: memory.size, endpoint };
+      return { entries: memory.size, endpoint, reachable: health().reachable };
     }
   };
 }

@@ -1,6 +1,8 @@
 ﻿import './styles.css';
 import { createAdFilteringLoader } from './ad-filter.js';
 import { applyIntentExtras } from './intent-extras.js';
+import { initIncrementalCast } from './incremental-cast.js'; // v3.4.0 纯增量：投屏装配入口
+import { initIncrementalPages } from './incremental-pages.js'; // v3.4.0 纯增量：分类片库 / 播放历史 / 三页切换装配入口
 
 const api = window.cineflow;
 const IMAGE_BASE = 'https://image.tmdb.org/t/p';
@@ -4314,6 +4316,12 @@ initStartupSplashCanvas();
 bindEvents();
 syncResourceSettings();
 loadInitial();
+
+// v3.4.0 纯增量：播放器投屏，异常自动跳过、不影响既有页面
+initIncrementalCast({ api, state, escapeHtml });
+
+// v3.4.0 纯增量：分类片库 / 播放历史 / 三页切换，异常自动跳过、基线首页不进 3D
+initIncrementalPages({ api, state, escapeHtml });
 
 
 

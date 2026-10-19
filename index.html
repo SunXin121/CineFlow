@@ -161,6 +161,27 @@
         <div id="detailContent" class="detail-content"></div>
       </aside>
 
+      <div id="castPanel" class="cast-panel" aria-hidden="true">
+        <div id="castBackdrop" class="cast-backdrop"></div>
+        <section class="cast-modal-card" role="dialog" aria-modal="true" aria-labelledby="castTitle">
+          <button id="castCloseBtn" class="panel-close" type="button" aria-label="关闭投屏">×</button>
+          <div class="cast-header">
+            <p class="eyebrow">CAST</p>
+            <h3 id="castTitle">投屏到设备</h3>
+            <button id="castRescanBtn" class="ghost-button cast-rescan" type="button" title="重新搜索设备" aria-label="重新搜索设备"><svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="5.5" /><path d="M12.8 12.8 16.5 16.5" /></svg></button>
+          </div>
+          <p id="castNowPlaying" class="cast-now-playing" hidden></p>
+          <div class="cast-section-title">DLNA / 电视接收器</div>
+          <div id="castDlnaList" class="cast-list cast-list-scroll"></div>
+          <div class="cast-section-title">
+            <span>无线显示器 / 扩展坞（蓝牙）</span>
+            <button id="castBluetoothSettingsBtn" class="cast-link-btn" type="button">蓝牙设置 ›</button>
+          </div>
+          <div id="castBluetoothList" class="cast-list"></div>
+          <p id="castHint" class="cast-hint" hidden></p>
+        </section>
+      </div>
+
       <div id="settingsModal" class="modal-backdrop is-hidden" aria-hidden="true">
         <section class="settings-card" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
           <button id="settingsCloseBtn" class="panel-close" type="button" aria-label="关闭设置">×</button>
@@ -235,6 +256,7 @@
             <div class="player-actions">
               <button id="playerCopyBtn" class="secondary-button" type="button">复制链接</button>
               <button id="playerExternalBtn" class="secondary-button" type="button">外部打开</button>
+              <button id="playerCastBtn" class="secondary-button cast-button" type="button" title="投屏到本机可发现的设备">⤴ 投屏</button>
               <button id="playerStopBtn" class="primary-button" type="button">关闭播放</button>
             </div>
           </div>
